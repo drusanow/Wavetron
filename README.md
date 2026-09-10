@@ -1,2 +1,2 @@
-# AMYWavetableSynth
-AMY Board wavetable synth with UI
+# Wavetron AMYWavetableSynth #
+Advanced AMY Board wavetable synth with UI
