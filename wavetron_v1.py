@@ -1,6 +1,6 @@
 # =============================================================================
-#  sketch_wt.py  --  AMYBOARD ADVANCED WAVETABLE SYNTH v1
-#  4-voice / 8-oscillator MicroPython wavetable synth for AMYboard (AMY engine)
+#                --  AMYBOARD ADVANCED WAVETABLE SYNTH v1 --
+#      4-voice MicroPython wavetable synth for AMYboard (AMY engine)
 # =============================================================================
 #
 #  ARCHITECTURE (per voice -- 5 AMY oscillators, 4 voices = 20 oscs, 8 sounding)
@@ -9,7 +9,7 @@
 #        |  chained_osc
 #      OSC A (WAVETABLE)  -- position/pitch/level/drive, amp EG, MOD3 envelope
 #        |  chained_osc
-#      OSC B (WAVETABLE)  -- ditto
+#      OSC B (WAVETABLE)  -- same as OSC A
 #
 #      MOD1 osc (silent)  \  mod_source of HEAD / A / B  -> mod0 coefficient
 #      MOD2 osc (silent)  /                              -> mod1 coefficient
@@ -20,31 +20,6 @@
 #  per-voice stereo spread possible at all, and it lets MONO / UNISON / POLY be
 #  three allocation policies over one fixed set of AMY objects, so switching
 #  mode allocates nothing and cuts no notes.
-#
-#  RULES INHERITED FROM THE MEGATRON (sketch_va8) BUILD -- DO NOT REGRESS:
-#    * amy.reset() at boot and on PANIC only.  Never on a parameter change.
-#    * vel=0 is note-off.
-#    * Bus 0 is always audible.
-#    * MIDI via midi.add_callback() -- never tulip.midi_callback(), which
-#      replaces the system dispatcher and breaks everything else.
-#    * A SOUNDING chain head filters ONLY ITSELF.  Only a wave=SILENT head is
-#      processed AFTER the chain is summed, so a voice-wide filter REQUIRES a
-#      silent head.  (src/amy.c render_osc_wave / render_envelope order.)
-#    * Per-osc `note` DOES NOT WORK inside a chain -- chained oscs are role
-#      SYNTH_IS_CHAINED and refuse notes.  All pitch offsets live in each osc's
-#      `freq` COEFFICIENT (const in Hz against REF_HZ, note coef 1).
-#    * `phase=` warps the RUNNING phase as well as setting the retrigger phase,
-#      so it is only ever sent on a full (re)build, never on a knob turn.
-#    * The head's amp must NOT carry an envelope: render_envelope() runs on the
-#      SUMMED chain for a SILENT osc, which would put a second VCA over the
-#      whole voice on top of each oscillator's own.
-#    * Display colours are 0..15 (framebuf GS4_HMSB low nibble), not 0..255.
-#    * OLED is an SH1107 at 0x3D; amyboard's autodetect binds the SSD1327
-#      driver to it and paints noise, so init_display() forces the driver.
-#
-#  VERIFIED AGAINST THE AMY SOURCE (shorepine/amy), not guessed -- see the
-#  "AMY CAPABILITY NOTES" block below for what is and is not available, and
-#  what each unavailable feature was replaced with.
 # =============================================================================
 
 import amy
@@ -76,23 +51,6 @@ def clamp(v, lo, hi):
         return hi
     return v
 
-
-# --------------------------------------------------------------------------
-#  RESILIENT AMY SEND  --  survive version skew between AMY builds
-# --------------------------------------------------------------------------
-#  The AMY on the web REPL, the AMYboard firmware and the desktop package are
-#  built from different snapshots, so a keyword one build knows another may
-#  reject outright: amy.message() raises "Unknown keyword X" the moment it sees
-#  one it does not have, and that aborts the WHOLE message.  That is exactly how
-#  a single unsupported `dist_clip` used to take the entire OSC A/B setup down
-#  with it -- leaving the oscillators as plain default sines, which is why
-#  changing the wavetable or its position "did nothing".
-#
-#  _amy_send() makes one unknown keyword cost only that keyword: it drops the
-#  rejected key and retries, so the wavetable, filter, envelopes and everything
-#  else in the same message still get through.  Each missing keyword is
-#  reported once.  The fast path (all keywords known) adds nothing but a
-#  try/except that never fires.
 _amy_unknown_kw = set()
 
 
@@ -144,102 +102,6 @@ def _amy_knows(kw):
 # boot(); assume present until then.  When False, the DRIVE/FOLD controls and
 # the DRIVE FX page simply do nothing rather than crashing the voice build.
 HAVE_DIST = True
-
-
-# =============================================================================
-#  AMY CAPABILITY NOTES  --  what the brief asked for vs what AMY actually has
-# =============================================================================
-#  Checked against src/amy.h, src/oscillators.c, src/pcm.c, amy/__init__.py's
-#  _KW_MAP_LIST (the source of truth for send() kwargs) and docs/api.md.
-#
-#  AVAILABLE, USED AS ASKED
-#    * wave=WAVETABLE (amy.h: 19).  A table is 256 samples per cycle; the cycle
-#      count is sample_length >> 8, so 16384 samples is 64 cycles.  `duty`
-#      crossfades across the cycles -- so WAVETABLE POSITION IS THE `duty`
-#      CONTROL-COEFFICIENT LIST, which means position scanning is modulated
-#      inside AMY's DSP by envelopes and LFOs at zero MicroPython cost.
-#      (oscillators.c render_wavetable.)
-#    * Custom wavetables from SD.  render_wavetable calls
-#      pcm_get_sample_ram_for_preset(), and pcm.c's get_preset_for_preset_number
-#      checks RAM/memory presets FIRST -- they shadow the baked-in ROM presets.
-#      So amy.load_sample(path, preset=N) makes an SD .wav playable as
-#      wave=WAVETABLE, preset=N.  This is the whole SD wavetable mechanism.
-#      shorepine/amy#997 widened it: ANY PCM .wav of at least two 256-sample
-#      cycles (>= 512 samples) is a valid wavetable now, not only purpose-built
-#      64-cycle ones -- render_wavetable only requires sample_length >=
-#      2*256 and derives the cycle count from the length -- so ordinary
-#      one-shot samples can be scanned as wavetables too.  The synth ALWAYS
-#      boots on its built-in tables and reads the card only on demand (the WT
-#      LOAD page, or a patch that names an SD table); see wt_builtins() /
-#      wt_scan_sd() and the STARTUP CONTRACT note in section 3.
-#    * Per-osc filter: filter_type 0-6 = none / LP12 / BP / HP / LP24 / NOTCH /
-#      PHASER, `resonance` 0.5-16, cutoff as a coefficient list (const Hz,
-#      other terms in OCTAVES) so cutoff modulation is free.
-#    * Two envelope generators per osc (bp0/eg0, bp1/eg1), up to 8 breakpoints,
-#      four curve shapes (eg0_type/eg1_type).  All envelopes are AMY's own --
-#      nothing is stepped from Python.
-#    * Distortion per osc AND per bus: dist_clip, dist_fold (wavefolder),
-#      dist_crush [bits,rate], dist_drive (coefs -> MODULATABLE), dist_mix.
-#    * Bus FX: reverb, chorus, echo, eq, plus the distortion block above.
-#    * portamento (ms) per osc, for MONO glide.
-#
-#  NOT AVAILABLE -- AND WHAT IS USED INSTEAD
-#    * OSCILLATOR SYNC.  AMY has no hard sync of any kind (no sync_osc /
-#      osc_sync anywhere in src/).  CLOSEST ALTERNATIVE, implemented: per-osc
-#      `phase` retrigger (PH.SYNC on the MIX page) locks both wavetables to a
-#      fixed start phase on every note-on, which gives the phase-coherent
-#      attack transient sync is usually reached for.  A real sync sweep is not
-#      possible without a C DSP slot.
-#    * TRUE AUDIO-RATE FM / RING MOD BETWEEN TWO WAVETABLES.  AMY's audio-rate
-#      FM engine is wave=ALGO, and docs/synth.md is explicit that ALGO operator
-#      sources must be SINE -- it cannot take wavetable operators.  The general
-#      `mod_source` path IS available to any wave, but it is evaluated once per
-#      audio BLOCK (control rate, AMY_BLOCK_SIZE/AMY_SAMPLE_RATE), not per
-#      sample.  IMPLEMENTED INSTEAD: MOD1/MOD2 have a RATE MODE -- as LFOs they
-#      are ordinary low-frequency modulators, and switched to AUDIO they track
-#      the played note by ratio and become FM/RM operators feeding the same
-#      coefficient slots.  MOD->PITCH is then FM, MOD->LEVEL is ring-mod
-#      flavour (log-domain, control-rate -- the aliased edge is characteristic,
-#      not a clean sideband spectrum).  This costs nothing extra: MOD1/MOD2 are
-#      silent mod oscs that already exist in every voice.
-#      Routing OSC B directly into OSC A as a mod_source would also work, but
-#      `mod_source` SILENCES the source oscillator -- it would cost the voice
-#      its second wavetable.  The shared-operator design above keeps both
-#      wavetables audible, which is what the brief actually wants.
-#    * FILTER RESONANCE MODULATION.  `resonance` is a plain float ('RF' in
-#      _KW_MAP_LIST), not a coefficient list, so nothing can modulate it inside
-#      AMY.  RESO is a static per-patch control; the MATRIX shows it as
-#      unavailable rather than pretending.
-#    * MODULATING AN FX PARAMETER, or an FM AMOUNT, per note.  Bus FX are bus
-#      scope -- they have no per-note modulation inputs at all (api.md is
-#      explicit that at bus scope only the const term of a coef list is used).
-#      An FM *amount* is itself a coefficient, and AMY cannot modulate a
-#      coefficient.  There is no workaround inside AMY: FM depth is the
-#      modulator's own amplitude, and a mod-source oscillator CANNOT carry an
-#      envelope either -- src/amy.c's note-on and note-off handlers both skip
-#      any osc whose role is SYNTH_IS_MOD_SOURCE (amy.c:1921 / :1983), so a mod
-#      osc never sees a velocity event and its EGs never fire.  An FM amount is
-#      therefore static per patch.  CLOSEST ALTERNATIVE, implemented: route
-#      MOD3/MOD4 (real envelopes) to the carrier's PITCH or LEVEL alongside the
-#      FM operator, which shapes how the FM reads across the note.  MOD1/MOD2
-#      phase CAN still be retriggered per note (TRIG on each MOD page), because
-#      `phase` is an ordinary parameter message, not a note event.
-#    * A BIPOLAR ENVELOPE / UNIPOLAR LFO as such.  AMY envelopes run 0..1 and
-#      an oscillator swings +/-1.  Both polarities are still provided, by
-#      compensating the destination's CONST term against the routing depth
-#      (see mod_terms()) -- exact for every linear/log destination.  Amplitude
-#      is the documented exception: amp coefficients combine in the LOG domain
-#      rather than adding, so amp routings are sent through un-compensated.
-#
-#  NOT VERIFIABLE FROM SOURCE ALONE -- CHECK ON YOUR BOARD
-#    * `wave=WAVETABLE` is compiled in only with -DAMY_WAVETABLE.  It is on in
-#      AMY's own Makefile and setup.py, but the AMYboard MicroPython firmware
-#      is built out of the tulipcc tree, which this sketch cannot inspect.  If
-#      your firmware lacks it, OSC A/B render silence.  Run wt_selftest() from
-#      the REPL: it plays a note, reads AMY's own output buffer back and tells
-#      you.  Set WT_ENABLED = False to fall back to SAW_DOWN oscillators and
-#      keep every other feature (filter, envelopes, matrix, FX) working.
-# =============================================================================
 
 # --------------------------------------------------------------------------
 #  SECTION 1 : CONFIGURATION
@@ -304,13 +166,6 @@ FILT_CEILING = 15000.0
 # --------------------------------------------------------------------------
 #  EURORACK CV IN  --  CV1 = GATE, CV2 = 1V/oct PITCH
 # --------------------------------------------------------------------------
-#  Ported verbatim from the Megatron (megatron_v1) build, which is verified
-#  working on this hardware.  The ONLY adaptations are structural: the note is
-#  addressed to voice 0's SILENT head (this synth is four one-voice synths, not
-#  one 8-osc voice), and the pitch CV rides the wavetable oscillators' `ext`
-#  freq coefficient via osc_freq_coefs().  Everything else -- the gate edge
-#  detector, the track/gate pitch paths, the by-ear calibration -- is the
-#  Megatron's code.
 #
 #  Both paths run in AMY's AUDIO THREAD, never a Python loop() poll: the gate
 #  is AMY's own C-side edge detector (cv_trigger), and TRACK-mode pitch is a
@@ -4805,3 +4660,5 @@ def loop(*args):
                 sys.print_exception(e)
             except Exception:
                 pass
+
+# Created by David Rusanow 2026 #
