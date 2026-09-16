@@ -330,17 +330,6 @@ GATE_HYST_RATIO = 0.2
 CV_GATE_ON     = 2.5       # gate opens above this many volts...
 CV_GATE_OFF    = CV_GATE_ON * GATE_HYST_RATIO   # ...and stays open until it dips below this
 CV_GATE_VEL    = 1.0       # velocity (0..1) given to CV-gated notes
-
-# SOFTWARE GATE.  AMY's cv_trigger reads the gate on the AUDIO thread, so it
-# collides with the main thread's OLED I2C writes -- a ground/bus bounce then
-# drops the reading (measured going NEGATIVE) and it re-fires: the retrigger.
-# Handling the gate here in loop() instead (a) reads the ADC on the SAME thread
-# as the OLED, so the two serialise instead of colliding, and (b) debounces:
-# the gate must read low for CV_GATE_OFF_SAMPLES consecutive polls before the
-# note releases, so a brief bounce is ignored.  Note-on stays fast (fires on the
-# first high poll); only release carries the debounce.
-CV_GATE_SOFTWARE   = True  # handle the gate in the sketch, not AMY's cv_trigger
-CV_GATE_OFF_SAMPLES = 2    # consecutive low polls (~loops) required to release
 CV_BASE_NOTE   = 60        # MIDI note that 0V on the pitch jack sounds
 CV_PITCH_TRIM_CENTS = 0.0  # + raises everything, - lowers (offset, cents)
 CV_PITCH_SCALE      = 1.0  # octaves added per volt (1.0 = a true 1V/oct)
@@ -539,7 +528,7 @@ P = {
     # ---- WT LOAD page: browse + load a user wavetable from SD -------------
     # None of these is a sound parameter -- they drive the SD browser, so a
     # patch never stores them (see PATCH_SKIP).
-    "wt_src": 0, "wt_browse": 0, "wt_load": 0, "wt_scan_act": 0,
+    "wt_src": 0, "wt_browse": 0, "wt_open": 0, "wt_load": 0, "wt_scan_act": 0,
     # ---- filter ----------------------------------------------------------
     "ftype": 4, "cutoff": 2500.0, "reso": 1.2, "fenv": 1.5,
     "fkbd": 0.35, "fvel": 0.25, "fdrv": 1.0, "fmix": 1.0,
@@ -1045,14 +1034,139 @@ def _sd_basename(rel):
     return rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
 
 
-def _sd_name(idx):
-    """Display name for a BROWSE-list entry (WT LOAD 'FILE' row).
+# --------------------------------------------------------------------------
+#  SD FOLDER BROWSER  --  navigate the card one directory at a time
+# --------------------------------------------------------------------------
+#  The WT LOAD page walks the card like a file manager: the FILE knob scrolls
+#  the CURRENT folder's entries -- ".." (up), sub-folders (shown with a trailing
+#  "/"), then .wav/.wt files -- OPEN descends into a folder (or goes up on ".."),
+#  and LOAD commits the highlighted file to the chosen oscillator.  This is
+#  separate from wt_scan_sd()'s flat recursive list, which stays for the REPL.
+_wt_cwd = None              # current directory being browsed (None = not listed)
+_wt_entries = []            # [(display, kind, path)]  kind: 'up' | 'dir' | 'file'
 
-    Shows the bare filename -- the folder path is only there to disambiguate,
-    and the focus row / browser pane show more of it."""
-    if not _sd_files:
-        return "--SCAN--"
-    return _sd_basename(_sd_files[int(clamp(idx, 0, len(_sd_files) - 1))][0])
+
+def _wt_parent(path):
+    """Parent directory of `path`, never climbing above the card root."""
+    root = _sd_card_root()
+    p = path.rstrip("/")
+    i = p.rfind("/")
+    parent = p[:i] if i > 0 else (root or p)
+    return parent or (root or p)
+
+
+def _wt_disp_cwd():
+    """The current folder as a short path relative to the card root."""
+    if not _wt_cwd:
+        return ""
+    root = _sd_card_root() or ""
+    rel = _wt_cwd[len(root):].strip("/") if _wt_cwd.startswith(root) else _wt_cwd
+    return rel or "/"
+
+
+def wt_list_dir(path):
+    """List one directory into the browser: folders first, then .wav/.wt files,
+    with a leading ".." when we are not at the card root.  Resets the cursor.
+    Returns the file count.  Never raises -- a missing card yields an empty
+    browser."""
+    global _wt_cwd, _wt_entries
+    root = _sd_card_root()
+    if path is None or root is None:
+        _wt_cwd = None
+        _wt_entries = []
+        P["wt_browse"] = 0
+        return 0
+    dirs = []
+    files = []
+    for name, is_dir in _sd_iter(path):
+        if name in _SD_SKIP or name.startswith("."):
+            continue
+        full = path + "/" + name
+        if is_dir:
+            dirs.append((name[:14] + "/", "dir", full))
+        else:
+            ln = name.lower()
+            if ln.endswith(".wav") or ln.endswith(".wt"):
+                files.append((name[:15], "file", full))
+    dirs.sort(key=lambda e: e[0].lower())
+    files.sort(key=lambda e: e[0].lower())
+    entries = []
+    if path.rstrip("/") != root.rstrip("/"):
+        entries.append(("..", "up", _wt_parent(path)))
+    entries.extend(dirs)
+    entries.extend(files)
+    _wt_cwd = path
+    _wt_entries = entries
+    P["wt_browse"] = 0
+    return len(files)
+
+
+def _wt_entry(idx=None):
+    """The highlighted browser entry (display, kind, path), or None."""
+    if not _wt_entries:
+        return None
+    if idx is None:
+        idx = P["wt_browse"]
+    return _wt_entries[int(clamp(idx, 0, len(_wt_entries) - 1))]
+
+
+def wt_browse_open():
+    """OPEN action: descend into the highlighted folder, or go up on '..'.
+    On a file it loads it too, so the click is never dead."""
+    if not _wt_entries:
+        wt_list_dir(_sd_card_root())
+        toast("SD ROOT" if _wt_cwd else "NO CARD")
+        return
+    _name, kind, path = _wt_entry()
+    if kind in ("up", "dir"):
+        wt_list_dir(path)
+        toast(("/" + _wt_disp_cwd())[:16])
+    else:
+        _wt_load_path(path)
+
+
+def wt_browse_load():
+    """LOAD action: load the highlighted file into the target OSC.  On a folder
+    it navigates instead, so the click is never dead."""
+    if not _wt_entries:
+        wt_list_dir(_sd_card_root())
+        toast("SD ROOT" if _wt_cwd else "NO CARD")
+        return
+    _name, kind, path = _wt_entry()
+    if kind == "file":
+        _wt_load_path(path)
+    else:
+        wt_list_dir(path)
+        toast(("/" + _wt_disp_cwd())[:16])
+
+
+def _wt_load_path(full):
+    """Commit the SD file at `full` to the chosen oscillator, verifying it loads
+    BEFORE committing so a short/corrupt file reports here rather than going
+    silent on the next note."""
+    name = full.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    existed = wt_index_of_path(full) >= 0
+    idx = wt_add_path(full, name)
+    if wt_preset_for(idx) is None:
+        if not existed:
+            WT_CATALOG.pop()            # remove the fresh, failed append
+        toast((_wt_last_error or "load failed")[:16])
+        return
+    tgt = int(P["wt_src"])
+    P["a_wt" if tgt == 0 else "b_wt"] = idx
+    wt_remember_selection()
+    (apply_osc_a if tgt == 0 else apply_osc_b)()
+    toast("%s>OSC %s" % (name[:7], "A" if tgt == 0 else "B"))
+
+
+def _sd_name(idx):
+    """Display for the WT LOAD 'FILE' row: the highlighted browser entry.
+
+    Folders carry a trailing '/', '..' is the go-up entry, files show the bare
+    name -- so the knob reads like a little file list."""
+    if not _wt_entries:
+        return "--OPEN--"
+    return _wt_entries[int(clamp(idx, 0, len(_wt_entries) - 1))][0]
 
 
 def wt_index_of_path(path):
@@ -2095,12 +2209,9 @@ def _cv_forget():
 
     Call this whenever AMY's trigger list is wiped out from under us -- only
     amy.reset() does that (panic, boot) -- so the cache never claims a trigger
-    is live when the engine has actually forgotten it.  Also drops the software
-    gate state so a held gate re-fires cleanly after the reset."""
-    global _cv_trigger_sig, _cv_gate_on, _cv_low_count
+    is live when the engine has actually forgotten it."""
+    global _cv_trigger_sig
     _cv_trigger_sig = None
-    _cv_gate_on = False
-    _cv_low_count = 0
 
 
 def setup_cv():
@@ -2124,14 +2235,6 @@ def setup_cv():
     if not CV_ENABLED:
         return
     sy = _cv_synth()
-    if CV_GATE_SOFTWARE:
-        # The sketch runs the gate now (service_cv_gate); make sure AMY's own
-        # audio-thread trigger is NOT also firing on the same jack -- clear it.
-        _cv_send("gate-clear", synth=sy, cv_trigger="%d" % CV_GATE_INPUT)
-        _cv_trigger_sig = None
-        if DEBUG_LOG:
-            dbg("CV gate = SOFTWARE (AMY trigger cleared)")
-        return
     note_off_msg = "i%dv%dl0" % (sy, HEAD)
     if CV_PITCH_MODE == 'gate':
         # Hand cv_trigger the pitch CV too, so AMY samples it at the gate edge
@@ -2163,73 +2266,6 @@ def setup_cv():
     _cv_send("gate-on", synth=sy, cv_trigger=on_msg)
     _cv_send("gate-off", synth=sy, cv_trigger=off_msg)
     _cv_trigger_sig = sig
-
-
-# --------------------------------------------------------------------------
-#  SOFTWARE GATE  --  debounced, main-thread gate handling (see CV_GATE_SOFTWARE)
-# --------------------------------------------------------------------------
-_cv_gate_on = False         # committed gate state
-_cv_low_count = 0           # consecutive sub-threshold polls (release debounce)
-
-
-def _cv_note_on():
-    """Fire the CV note on voice 0's head, exactly as AMY's cv_trigger did.
-
-    In 'track' mode the head carries the base pitch and the live 1V/oct CV rides
-    the oscillators' ext coefficient; in 'gate' mode the pitch jack is sampled
-    now and baked into the note."""
-    sy = _cv_synth()
-    if CV_PITCH_MODE == 'gate':
-        try:
-            raw = amyboard.cv_in(CV_PITCH_INPUT)
-        except Exception:
-            raw = 0.0
-        note = cv_note_for(raw)
-    else:
-        note = cv_base_note()
-    note = clamp(note, 0.0, 127.0)
-    _amy_send(synth=sy, osc=HEAD, note=round(note, 3), vel=round(CV_GATE_VEL, 4))
-
-
-def _cv_note_off():
-    _amy_send(synth=_cv_synth(), osc=HEAD, vel=0)
-
-
-def service_cv_gate():
-    """Poll the gate jack once per loop and drive the CV note with debounce.
-
-    Runs on the MAIN thread (same as the OLED), so the ADC read never collides
-    with a display refresh the way AMY's audio-thread trigger did.  A brief dip
-    (ground/bus bounce) is rejected: the gate must read low for
-    CV_GATE_OFF_SAMPLES consecutive polls before the note releases."""
-    global _cv_gate_on, _cv_low_count
-    if not (CV_ENABLED and CV_GATE_SOFTWARE):
-        return
-    try:
-        g = amyboard.cv_in(CV_GATE_INPUT)
-    except Exception:
-        return
-    if not _cv_gate_on:
-        if g >= CV_GATE_ON:
-            _cv_note_on()
-            _cv_gate_on = True
-            _cv_low_count = 0
-            if DEBUG_LOG:
-                dbg("SWGATE on %.3fV" % g)
-    else:
-        if g < CV_GATE_OFF:
-            _cv_low_count += 1
-            if _cv_low_count >= CV_GATE_OFF_SAMPLES:
-                _cv_note_off()
-                _cv_gate_on = False
-                _cv_low_count = 0
-                if DEBUG_LOG:
-                    dbg("SWGATE off %.3fV" % g)
-        else:
-            if _cv_low_count and DEBUG_LOG:
-                # The debounce catching a bounce -- this is the fix at work.
-                dbg("SWGATE dip rejected %.3fV (held note)" % g)
-            _cv_low_count = 0
 
 
 def push_cv_pitch():
@@ -2473,19 +2509,16 @@ def dbg_service(force=False):
     global _dbg_gate_state, _dbg_out_hi
     if not DEBUG_LOG:
         return
-    # gate crossings (a real edge would explain a legit re-fire).  Skipped when
-    # the software gate owns the jack -- service_cv_gate() reads it and logs the
-    # SWGATE on/off/dip events, so re-reading here would just double the I2C.
-    if not CV_GATE_SOFTWARE:
-        try:
-            g = amyboard.cv_in(CV_GATE_INPUT)
-            st = 1 if g >= CV_GATE_ON else (0 if g < CV_GATE_OFF else _dbg_gate_state)
-            if st != _dbg_gate_state:
-                dbg("GATE->%s %.3fV" % ("HIGH" if st == 1 else
-                                        ("LOW" if st == 0 else "mid"), g))
-                _dbg_gate_state = st
-        except Exception:
-            pass
+    # gate crossings (a real edge would explain a legit re-fire)
+    try:
+        g = amyboard.cv_in(CV_GATE_INPUT)
+        st = 1 if g >= CV_GATE_ON else (0 if g < CV_GATE_OFF else _dbg_gate_state)
+        if st != _dbg_gate_state:
+            dbg("GATE->%s %.3fV" % ("HIGH" if st == 1 else
+                                    ("LOW" if st == 0 else "mid"), g))
+            _dbg_gate_state = st
+    except Exception:
+        pass
     # output re-attack detector: peak of the post-FX buffer.  A jump from low
     # back up to a strong level is an envelope re-attack (the retrigger) even
     # when it was fired inside AMY by cv_trigger and the sketch never saw a note.
@@ -2732,6 +2765,7 @@ PAGES = [
     ("WT LOAD", [
         ("TARGET",  "wt_src",      0, 1,   1, 'e',  'none'),
         ("FILE",    "wt_browse",   0, 999, 1, 'sd', 'none'),
+        ("OPEN",    "wt_open",     0, 1,   1, 'a',  'none'),
         ("LOAD",    "wt_load",     0, 1,   1, 'a',  'none'),
         ("SCAN SD", "wt_scan_act", 0, 1,   1, 'a',  'none'),
     ]),
@@ -2879,7 +2913,8 @@ SHORT = {
     "b_lvl": "LVL", "b_drv": "DRV", "b_fold": "FLD", "b_phase": "PHS",
     "vmode": "VOI", "glide": "GLD", "vsens": "VEL", "phsync": "SYN",
     "bend": "BND", "mch": "MID", "vol": "VOL", "panic": "PNC",
-    "wt_src": "DST", "wt_browse": "FIL", "wt_load": "LD", "wt_scan_act": "SCN",
+    "wt_src": "DST", "wt_browse": "FIL", "wt_open": "OPN", "wt_load": "LD",
+    "wt_scan_act": "SCN",
     "ftype": "TYP", "cutoff": "CUT", "reso": "RES", "fenv": "ENV",
     "fkbd": "KBD", "fvel": "VEL", "fdrv": "DRV", "fmix": "MIX",
     "aa": "ATK", "ad": "DEC", "as": "SUS", "ar": "REL", "acurve": "CRV",
@@ -2974,7 +3009,7 @@ def row_hi(row):
     if kind == 'wt':
         return max(0, wt_count() - 1)
     if kind == 'sd':
-        return max(0, len(_sd_files) - 1)
+        return max(0, len(_wt_entries) - 1)
     return hi
 
 
@@ -3042,39 +3077,15 @@ def fire_action(key):
         apply_matrix()
         toast("MATRIX CLEARED")
     elif key == "wt_scan_act":
-        n = wt_scan_sd()
-        P["wt_browse"] = 0
-        toast("%d ON SD" % n if n else "NO SD FILES")
+        # Rescan the card and return the browser to the root folder.
+        wt_scan_sd()                    # keep the REPL flat list fresh too
+        n = wt_list_dir(_sd_card_root())
+        toast("SD ROOT %dF" % n if _wt_cwd else "NO CARD")
+    elif key == "wt_open":
+        wt_browse_open()
     elif key == "wt_load":
-        _wt_load_selected()
+        wt_browse_load()
     P[key] = 0
-
-
-def _wt_load_selected():
-    """Commit the browsed SD file to the chosen oscillator.
-
-    Verifies the table actually loads BEFORE committing the selection, so a
-    short or corrupt file reports here rather than going silent on the next
-    note.  A file that fails is dropped straight back out of the catalogue, so
-    the TABLE knob is never left pointing at a dud."""
-    if not _sd_files:
-        toast("SCAN SD FIRST")
-        return
-    rel, path = _sd_files[int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))]
-    name = _sd_basename(rel)
-    existed = wt_index_of_path(path) >= 0
-    idx = wt_add_path(path, name)
-    if wt_preset_for(idx) is None:
-        if not existed:
-            WT_CATALOG.pop()            # remove the fresh, failed append
-        # Show the actual reason (bad format, too short, ...) not a bare fail.
-        toast((_wt_last_error or "load failed")[:16])
-        return
-    tgt = int(P["wt_src"])
-    P["a_wt" if tgt == 0 else "b_wt"] = idx
-    wt_remember_selection()
-    (apply_osc_a if tgt == 0 else apply_osc_b)()
-    toast("%s>OSC %s" % (name[:7], "A" if tgt == 0 else "B"))
 
 
 # --------------------------------------------------------------------------
@@ -3092,7 +3103,7 @@ MAX_PATCHES = 24
 # Momentary actions and the matrix cursor are UI state, not sound: saving them
 # would fire a PANIC (or move somebody's cursor) on every load of that patch.
 PATCH_SKIP = ("panic", "mx_clr", "mx_clrall", "mx_slot", "mx_dest", "mx_amt",
-              "wt_src", "wt_browse", "wt_load", "wt_scan_act",
+              "wt_src", "wt_browse", "wt_open", "wt_load", "wt_scan_act",
               # CV calibration is rig-specific, not part of a sound.
               "cvoff", "cvatt", "cvgate", "cvnote")
 
@@ -3331,26 +3342,6 @@ OLED_ADDR = 0x3D
 DISPLAY_ROTATION = 0
 DISPLAY_OK = False
 
-# Screen FADE-UP.  When the whole screen changes (page change / entering or
-# leaving the screen picker) the panel is dipped dark and ramped back to
-# OLED_CONTRAST over OLED_FADE_MS.  It softens the brightness step -- a smaller
-# di/dt on the panel's illumination current, which is gentler on the shared CV
-# ground -- and it simply looks nice.  It does NOT shrink the framebuffer's I2C
-# burst, so the real CV-retrigger fix stays the software gate; this is polish.
-OLED_FADE     = True
-OLED_CONTRAST = 0x80       # steady brightness (SH1107 power-on default); tunable
-OLED_FADE_MIN = 0x00       # brightness at the instant a new screen appears
-OLED_FADE_MS  = 180        # ramp time OLED_FADE_MIN -> OLED_CONTRAST
-
-# I2C yield fallback.  Current AMYboard firmware pushes the OLED through a
-# background, 256-byte-chunked I2C task so the audio-thread CV reads interleave
-# between chunks (amyboard.Display sets display._bg = True).  On OLDER firmware
-# without that task the refresh writes blast back-to-back and can starve the CV
-# poll -- the Discord advice.  When the background path is ABSENT we wrap the
-# panel's blocking I2C with a shim that yields ~1ms every ~256 bytes, the manual
-# equivalent.  A no-op when the firmware already backgrounds the writes.
-OLED_CHUNK_FALLBACK = True
-
 PATCH_PAGE = len(PAGES)
 N_PAGES = len(PAGES) + 1
 
@@ -3386,79 +3377,6 @@ def toast(msg):
 def need_ui():
     global need_redraw
     need_redraw = True
-
-
-class _ChunkSleepI2C:
-    """Blocking-I2C shim that yields the bus ~1ms every ~256 bytes of pixel
-    data, so AMY's audio-thread CV reads interleave with a big OLED refresh
-    instead of being starved.  It is the manual equivalent of the firmware's
-    background chunker, for builds that lack tulip.i2c_bg_write; it just wraps
-    the panel's real I2C and adds the yields, so it can't race anything.
-
-    Mirrors how the sh1107 driver calls its bus: writeto() carries a command
-    (small -- passed straight through) and writevto() carries pixel data."""
-    _YIELD_EVERY = 256
-
-    def __init__(self, real):
-        self._real = real
-        self._acc = 0
-
-    def writeto(self, addr, buf, *a, **k):
-        return self._real.writeto(addr, buf, *a, **k)
-
-    def writevto(self, addr, bufs, *a, **k):
-        r = self._real.writevto(addr, bufs, *a, **k)
-        try:
-            for b in bufs:
-                self._acc += len(b)
-        except Exception:
-            self._acc += self._YIELD_EVERY
-        if self._acc >= self._YIELD_EVERY:
-            self._acc = 0
-            try:
-                time.sleep_ms(1)
-            except AttributeError:
-                time.sleep(0.001)
-        return r
-
-
-_oled_bg = False            # firmware backgrounds panel writes (display._bg)
-_oled_chunked = False       # we installed the _ChunkSleepI2C yield fallback
-
-
-def _install_i2c_yield():
-    """If the firmware is NOT backgrounding panel writes, wrap the panel's
-    blocking I2C so a refresh yields the bus for the CV reads (Discord advice).
-    Guarded/defensive: any failure just leaves the original path untouched."""
-    global _oled_bg, _oled_chunked
-    try:
-        d = getattr(amyboard, "display", None)
-        _oled_bg = bool(getattr(d, "_bg", False))
-        if _oled_bg or not OLED_CHUNK_FALLBACK:
-            return                       # firmware already interleaves -> leave it
-        hw = getattr(d, "_hw", None)
-        i2c = getattr(hw, "i2c", None) if hw is not None else None
-        if i2c is None or isinstance(i2c, _ChunkSleepI2C):
-            return
-        hw.i2c = _ChunkSleepI2C(i2c)
-        _oled_chunked = True
-    except Exception as e:
-        print("i2c yield shim: not installed (%s)" % e)
-
-
-def display_path_status():
-    """Report how OLED bytes reach the panel -- the key thing for audio glitches
-    during big redraws."""
-    if not DISPLAY_OK:
-        print("display: no panel")
-        return
-    if _oled_bg:
-        print("display I2C: firmware background chunker (CV-safe) -- ideal")
-    elif _oled_chunked:
-        print("display I2C: blocking + our ~1ms/256B yield shim (CV-safe)")
-    else:
-        print("display I2C: blocking, no yield -- a big redraw may glitch CV/"
-              "audio; update firmware for the background chunker")
 
 
 def init_display():
@@ -3499,13 +3417,6 @@ def init_display():
         DISPLAY_OK = False
     print("init_display: SH1107 at 0x%02X rot %d -- %s"
           % (OLED_ADDR, DISPLAY_ROTATION, "OK" if DISPLAY_OK else "no panel"))
-    if DISPLAY_OK:
-        _install_i2c_yield()        # CV-safe I2C on firmware without the bg task
-        display_path_status()
-        if OLED_FADE:
-            # Establish the steady brightness the fade returns to, so a fade
-            # never shifts the baseline away from the driver's default.
-            _oled_set_contrast(OLED_CONTRAST)
     return DISPLAY_OK
 
 
@@ -3515,70 +3426,6 @@ def display_refresh():
             amyboard.display_refresh()
         except Exception as e:
             print("display_refresh failed:", e)
-
-
-# --------------------------------------------------------------------------
-#  SCREEN FADE-UP  (see OLED_FADE)
-# --------------------------------------------------------------------------
-_oled_c = -1                # last contrast value written (-1 = unknown)
-_fade_t0 = 0
-_fade_on = False
-
-
-def _oled_set_contrast(v):
-    """Write the SH1107 global contrast register (0..255).  No-op if the driver
-    doesn't expose contrast, or the value is unchanged."""
-    global _oled_c
-    v = int(clamp(v, 0, 255))
-    if v == _oled_c:
-        return
-    _oled_c = v
-    d = getattr(amyboard, "display", None)
-    if d is None:
-        return
-    # Drivers name it differently; try the usual ones, else the raw 0x81 cmd.
-    for name in ("contrast", "set_contrast"):
-        fn = getattr(d, name, None)
-        if fn is not None:
-            try:
-                fn(v)
-                return
-            except Exception:
-                pass
-    for name in ("write_cmd", "_write_command", "command"):
-        fn = getattr(d, name, None)
-        if fn is not None:
-            try:
-                fn(0x81)
-                fn(v)
-                return
-            except Exception:
-                pass
-
-
-def oled_fade_begin():
-    """Called on a whole-screen change: dip dark NOW (before the new frame is
-    pushed), then service_oled_fade() ramps back up over the next frames."""
-    global _fade_t0, _fade_on
-    if not (OLED_FADE and DISPLAY_OK):
-        return
-    _fade_t0 = _now()
-    _fade_on = True
-    _oled_set_contrast(OLED_FADE_MIN)
-
-
-def service_oled_fade():
-    """Advance an in-progress fade.  Called every loop; cheap no-op otherwise."""
-    global _fade_on
-    if not _fade_on:
-        return
-    el = _dt(_now(), _fade_t0)
-    if el >= OLED_FADE_MS:
-        _oled_set_contrast(OLED_CONTRAST)
-        _fade_on = False
-        return
-    frac = el / float(OLED_FADE_MS)
-    _oled_set_contrast(OLED_FADE_MIN + (OLED_CONTRAST - OLED_FADE_MIN) * frac)
 
 
 def is_patch_page():
@@ -4038,34 +3885,42 @@ def draw_vis_unison(d, y0, h):
 
 
 def draw_vis_wtload(d, y0, h):
-    """The SD browser: the file list with the cursor, and the load target.
-
-    Empty until SCAN SD is run, which is the whole point -- the card is only
-    read on demand."""
+    """The SD folder browser: the current directory with the cursor, its path,
+    and the load target.  OPEN descends into a folder / goes up on '..'; LOAD
+    commits the highlighted file to the target OSC."""
     y_hi = y0 + h
     d.fill_rect(0, y0, SCREEN_W, h, 0)
     tgt = "A" if int(P["wt_src"]) == 0 else "B"
-    d.text("-> OSC %s   %d FILES" % (tgt, len(_sd_files)), 2, y0, C_DIM)
-    if not _sd_files:
-        d.text("RUN SCAN SD", 2, y0 + 14, C_LABEL)
-        d.text("TO LIST .wav", 2, y0 + 26, C_DIM)
-        d.text("ON THE CARD", 2, y0 + 38, C_DIM)
+    # header: target OSC + the current folder (breadcrumb), root shown as "/"
+    crumb = _wt_disp_cwd()
+    crumb = "/" + crumb if crumb and crumb != "/" else "/"
+    d.text(("-> OSC %s  %s" % (tgt, crumb))[:21], 2, y0, C_DIM)
+    if _wt_cwd is None:
+        d.text("NO SD CARD", 2, y0 + 16, C_LABEL)
+        d.text("SCAN SD to retry", 2, y0 + 28, C_DIM)
         return
-    sel = int(clamp(P["wt_browse"], 0, len(_sd_files) - 1))
-    top = max(0, min(sel - 2, max(0, len(_sd_files) - 5)))
-    for k in range(5):
+    if not _wt_entries:
+        d.text("(empty folder)", 2, y0 + 16, C_DIM)
+        return
+    sel = int(clamp(P["wt_browse"], 0, len(_wt_entries) - 1))
+    rows = max(1, (h - 12) // 10)
+    top = max(0, min(sel - rows // 2, max(0, len(_wt_entries) - rows)))
+    for k in range(rows):
         i = top + k
-        if i >= len(_sd_files):
+        if i >= len(_wt_entries):
             break
         y = y0 + 12 + k * 10
         if y + 8 > y_hi:
             break
-        name = _sd_basename(_sd_files[i][0])
+        name, kind, _p = _wt_entries[i]
+        # a small glyph marks folders / up so they read differently from files
+        mark = "[" if kind == "dir" else ("^" if kind == "up" else " ")
+        label = (mark + name)[:16] if kind != "file" else name[:16]
         if i == sel:
             _vrect(d, 0, y - 1, SCREEN_W, 9, C_VIS, y0, y_hi)
-            d.text(name[:15], 2, y, 0)
+            d.text(label, 2, y, 0)
         else:
-            d.text(name[:15], 2, y, C_LABEL)
+            d.text(label, 2, y, C_LABEL if kind == "file" else C_DIM)
 
 
 def draw_vis_voices(d, y0, h):
@@ -4494,7 +4349,10 @@ def _goto_page(p):
         # Land on the MATRIX page showing the routing the cursor points at,
         # not a stale AMOUNT from the last time it was open.
         P["mx_amt"] = mx_get(int(P["mx_slot"]), DEST_IDS[int(P["mx_dest"])])
-    oled_fade_begin()           # whole screen changed -> fade it up
+    if not is_patch_page() and PAGES[page][0] == "WT LOAD" and _wt_cwd is None:
+        # First visit (or a card inserted since boot): list the card root so the
+        # browser has something to show without a manual scan.
+        wt_list_dir(_sd_card_root())
     need_redraw = True
 
 
@@ -4638,14 +4496,12 @@ def _enter_page_mode():
     page_mode = True
     editing = False
     pmode = 'list'
-    oled_fade_begin()
     need_redraw = True
 
 
 def _exit_page_mode():
     global page_mode, need_redraw
     page_mode = False
-    oled_fade_begin()
     need_redraw = True
 
 
@@ -5227,8 +5083,7 @@ def boot():
 
     print("AMYBOARD WAVETABLE ready -- %d voices on synths %s"
           % (NVOICE, VOICE_SYNTHS))
-    print("REPL helpers: status() wt_scan() sd_ls() cv_status() "
-          "display_path_status()")
+    print("REPL helpers: status() wt_scan() sd_ls() wt_wavinfo(p) cv_status()")
     if DEBUG_LOG:
         print("  DEBUG LOG ON -> SD:%s  (replicate the retrigger, then read it)"
               % DEBUG_LOG_FILE)
@@ -5279,8 +5134,6 @@ def loop(*args):
         # #2: flush the tick's coalesced parameter changes as one burst BEFORE
         # drawing, so the frame we paint already reflects them.
         service_apply()
-        # Debounced software CV gate (main-thread; see CV_GATE_SOFTWARE).
-        service_cv_gate()
         # Runtime debug trace (gate crossings + output re-attacks) to SD.
         if DEBUG_LOG:
             dbg_service()
@@ -5313,8 +5166,6 @@ def loop(*args):
                 y0, h = vis_band()
                 draw_vis_cvcal(amyboard.display, y0, h)
                 display_refresh()
-        # Advance a screen fade-up, if one is in progress.
-        service_oled_fade()
     except Exception as e:
         # loop() runs every ~60 ms: print the real traceback once, then stay
         # quiet, or a recurring fault floods the console and buries the one
